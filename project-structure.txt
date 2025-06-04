@@ -1,0 +1,27 @@
+.
+├── README.md
+├── backend
+│   ├── app
+│   ├── hello.py
+│   ├── pyproject.toml
+│   └── uv.lock
+├── env
+│   ├── bin
+│   ├── include
+│   ├── lib
+│   └── pyvenv.cfg
+├── frontend
+│   ├── README.md
+│   ├── eslint.config.mjs
+│   ├── next-env.d.ts
+│   ├── next.config.ts
+│   ├── node_modules
+│   ├── package-lock.json
+│   ├── package.json
+│   ├── postcss.config.mjs
+│   ├── public
+│   ├── src
+│   └── tsconfig.json
+└── project-structure.txt
+
+11 directories, 14 files
