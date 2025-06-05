@@ -1,3 +1,5 @@
+# ![Orchids Logo](images/1748464302927.jpeg)  
+
 # Orchids SWE Intern Challenge Template
 
 This project consists of a backend built with FastAPI and a frontend built with Next.js and TypeScript.
