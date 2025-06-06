@@ -11,6 +11,8 @@ from dotenv import load_dotenv
 import traceback
 import os
 from pathlib import Path
+from urllib.parse import urljoin
+from bs4 import Tag
 
 dotenv_path = Path(__file__).resolve().parent.parent / ".env"
 load_dotenv(dotenv_path)
@@ -137,6 +139,34 @@ async def scrape_and_analyze(request: URLRequest):
             # Parse the HTML content using BeautifulSoup
     soup = BeautifulSoup(html_content, 'lxml')
 
+
+    # Inline CSS styles are often used in web pages, so we should extract them
+    styles = ""
+    for link_tag in soup.find_all("link", rel="stylesheet"):
+        if isinstance(link_tag, Tag):
+            href = link_tag.get("href")
+            if href:
+                full_url = urljoin(url, str(href))
+                try:
+                    async with httpx.AsyncClient() as client:
+                        css_response = await client.get(full_url, timeout=5)
+                        css_response.raise_for_status()
+                        styles += f"\n/* From: {href} */\n" + css_response.text + "\n"
+                except:
+                    continue
+            link_tag.decompose()
+    
+    if styles:
+        style_tag = soup.new_tag("style")
+        style_tag.string = styles
+        if soup.head:
+            soup.head.append(style_tag)
+
+    for img in soup.find_all("img"):
+        if isinstance(img, Tag):
+            img["src"] = "https://via.placeholder.com/150"
+            img["alt"] = img.get("alt") or "placeholder image"
+
     # Extract relevant information from the soup object
     # Extract text content & tags
     for tag in soup.find_all(['script', 'style', 'meta', 'noscript', 'header', 'footer', 'nav', 'form', 'iframe', 'aside', 'input', 'button', 'svg', 'link']):
@@ -148,15 +178,24 @@ async def scrape_and_analyze(request: URLRequest):
     
     # Send to Gemini
     prompt = f"""
-You are a web cloning assistant. Based on the HTML below, generate a full HTML page that visually looks like the original website.
+You're an expert front-end engineer and web designer.
 
-Focus on layout, text content, structure, and style. Use embedded CSS and placeholders for assets (like images or icons).
+Here is a raw HTML snapshot of a website, with some inline styles and a stylesheet included. 
+Your task is to **recreate** this site layout as accurately as possible in **a single self-contained HTML file**.
 
+Use:
+- Inline `<style>` for all CSS
+- `<div>` and semantic tags for layout
+- `font-family`, `colors`, and `spacing` similar to original
+- Placeholder image: https://via.placeholder.com/300
+- Respect font sizes, layout flow, and header hierarchies
+- Recreate navigation, hero sections, buttons, etc. faithfully
+
+### START OF HTML SNAPSHOT ###
 {html_structure}
+### END OF HTML SNAPSHOT ###
 
-Return a complete HTML page starting with <!DOCTYPE html>.
-
-Please return a full HTML page with embedded CSS that mimics the layout, fonts, and colors as best as possible. You can use placeholder images or links where needed.
+Please return a complete HTML page starting with `<!DOCTYPE html>` and no explanation text.
 """
 
     try:
