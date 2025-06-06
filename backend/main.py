@@ -4,12 +4,15 @@ from pydantic import BaseModel
 from typing import Dict, List
 import uvicorn
 import httpx
+import base64
+from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 from typing import Optional
 import google.generativeai as genai
 from dotenv import load_dotenv
 import traceback
 import os
+from playwright.async_api import async_playwright
 from pathlib import Path
 
 dotenv_path = Path(__file__).resolve().parent.parent / ".env"
@@ -116,6 +119,27 @@ if not api_key:
 # Correct way to configure the API key for google.generativeai
 genai.configure(api_key=api_key)
 
+async def take_screenshot_with_playwright(url: str) -> Optional[str]:
+    """
+    Takes a screenshot of the given URL using Playwright and returns it as a base64 encoded string.
+    Returns None if an error occurs.
+    """
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch()
+            page = await browser.new_page()
+            await page.goto(url, timeout=60000) # Increased timeout for slower pages
+            screenshot_bytes = await page.screenshot(type='png') # Specify PNG for definite MIME type
+            await browser.close()
+
+            base64_encoded_screenshot = base64.b64encode(screenshot_bytes).decode('utf-8')
+            print(f"Successfully took screenshot for {url}")
+            return base64_encoded_screenshot
+    except Exception as e:
+        print(f"Error taking screenshot with Playwright for {url}: {e}")
+        traceback.print_exc() # Print full traceback for debugging
+        return None
+
 @app.post("/scrape-and-analyze")
 # Endpoint to scrape a URL and return cleaned text content
 async def scrape_and_analyze(request: URLRequest):
@@ -132,14 +156,58 @@ async def scrape_and_analyze(request: URLRequest):
             # Get the HTML content as text
             html_content = response.text
             print(f"Fetched HTML content from {url}")
+
+    # Take screenshot
+    base64_screenshot = await take_screenshot_with_playwright(url)
+
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to fetch URL: {str(e)}")
             # Parse the HTML content using BeautifulSoup
     soup = BeautifulSoup(html_content, 'lxml')
 
+    # --- Start Image Scraping ---
+    img_tags = soup.find_all('img')
+    print(f"Found {len(img_tags)} image tags.")
+
+    async with httpx.AsyncClient() as image_client:
+        for img_tag in img_tags:
+            src = img_tag.get('src')
+            if not src:
+                print("Image tag found with no src, skipping.")
+                continue
+
+            try:
+                # Make URL absolute
+                abs_src = urljoin(url, src)
+                print(f"Attempting to download image: {abs_src}")
+
+                # Fetch image data
+                img_response = await image_client.get(abs_src, timeout=10)
+                img_response.raise_for_status() # Check for HTTP errors
+
+                # Convert image to base64
+                img_content = img_response.content
+                mime_type = img_response.headers.get('content-type', 'image/png') # Default to png if not found
+                base64_encoded_img = base64.b64encode(img_content).decode('utf-8')
+
+                # Update img tag src with base64 data URI
+                img_tag['src'] = f"data:{mime_type};base64,{base64_encoded_img}"
+                print(f"Successfully processed and embedded image: {abs_src}")
+
+            except httpx.HTTPStatusError as e:
+                print(f"HTTP error downloading image {abs_src}: {e.response.status_code} - {e.response.text}")
+                img_tag['alt'] = img_tag.get('alt', '') + f" (Image not found: {abs_src})"
+            except httpx.RequestError as e:
+                print(f"Request error downloading image {abs_src}: {e}")
+                img_tag['alt'] = img_tag.get('alt', '') + f" (Image not found: {abs_src})"
+            except Exception as e:
+                print(f"Error processing image {abs_src}: {e}")
+                img_tag['alt'] = img_tag.get('alt', '') + f" (Image processing error: {abs_src})"
+    # --- End Image Scraping ---
+
     # Extract relevant information from the soup object
     # Extract text content & tags
-    for tag in soup.find_all(['script', 'style', 'meta', 'noscript', 'header', 'footer', 'nav', 'form', 'iframe', 'aside', 'input', 'button', 'svg', 'link']):
+    for tag in soup.find_all(['script', 'meta', 'noscript', 'header', 'footer', 'nav', 'form', 'iframe', 'aside', 'input', 'button', 'svg']):
         tag.decompose()
 
     html_structure = soup.prettify()
@@ -147,17 +215,30 @@ async def scrape_and_analyze(request: URLRequest):
 
     
     # Send to Gemini
-    prompt = f"""
-You are a web cloning assistant. Based on the HTML below, generate a full HTML page that visually looks like the original website.
+    # Construct the prompt for Gemini
+    prompt_parts = [
+        "You are an expert web cloning assistant. Your goal is to replicate a webpage as accurately as possible, visually and structurally.",
+        "You will be given the HTML structure (which now includes original CSS and base64 embedded images) and a base64 encoded screenshot of the original page.",
+        "Prioritize the visual accuracy based on the screenshot.",
+        "Ensure the generated HTML page uses embedded CSS to style elements. The provided HTML may already contain <style> tags or <link rel=\"stylesheet\"> tags; preserve and utilize these.",
+        "Images in the provided HTML are already embedded as base64 data URIs. Ensure these are correctly rendered.",
+        "Pay close attention to layout, element positioning, fonts, colors, spacing, and overall visual hierarchy as depicted in the screenshot.",
+        "Return a single, complete HTML page starting with <!DOCTYPE html>.",
+        "Here is the HTML structure (with embedded CSS and images):",
+        html_structure,
+    ]
 
-Focus on layout, text content, structure, and style. Use embedded CSS and placeholders for assets (like images or icons).
+    if base64_screenshot:
+        prompt_parts.extend([
+            "And here is the base64 encoded PNG screenshot of the original page for visual reference:",
+            f"data:image/png;base64,{base64_screenshot}",
+            "Use this screenshot as your primary guide for visual replication."
+        ])
+    else:
+        prompt_parts.append("A screenshot could not be captured, so rely solely on the provided HTML structure and embedded styles/images.")
 
-{html_structure}
-
-Return a complete HTML page starting with <!DOCTYPE html>.
-
-Please return a full HTML page with embedded CSS that mimics the layout, fonts, and colors as best as possible. You can use placeholder images or links where needed.
-"""
+    prompt_parts.append("Generate the full HTML page now.")
+    prompt = "\n\n".join(prompt_parts)
 
     try:
         # Instantiate the model directly
