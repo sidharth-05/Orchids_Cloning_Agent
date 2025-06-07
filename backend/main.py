@@ -1,234 +1,107 @@
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
-from typing import Dict, List
-import uvicorn
-import httpx
+from fastapi.middleware.cors import CORSMiddleware
+import asyncio
+import base64
+from playwright.async_api import async_playwright
+import openai
+import requests
 from bs4 import BeautifulSoup
-from typing import Optional
-import google.generativeai as genai
-from dotenv import load_dotenv
-import traceback
+import openai
 import os
-from pathlib import Path
-from urllib.parse import urljoin
-from bs4 import Tag
+from dotenv import load_dotenv
+import re
 
-dotenv_path = Path(__file__).resolve().parent.parent / ".env"
-load_dotenv(dotenv_path)
-print("Loaded API Key:", os.getenv("GEMINI_API_KEY"))
-# Removed genai.list_models() as it does not exist in the google.generativeai module
+load_dotenv()
 
-# Create FastAPI instance
-app = FastAPI(
-    title="Orchids Challenge API",
-    description="A starter FastAPI template for the Orchids Challenge backend",
-    version="1.0.0"
-)
+app = FastAPI()
 
-# Add CORS middleware
+# Allow CORS for frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, replace with specific domains
-    allow_credentials=True,
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+openai.api_key = os.getenv("OPENAI_API_KEY")
 
-#------------- Defaults -------------#
-# Pydantic models
-class Item(BaseModel):
-    id: int
-    name: str
-    description: Optional[str] = None
-
-
-class ItemCreate(BaseModel):
-    name: str
-    description: Optional[str] = None
-
-
-# In-memory storage for demo purposes
-items_db: List[Item] = [
-    Item(id=1, name="Sample Item", description="This is a sample item"),
-    Item(id=2, name="Another Item", description="This is another sample item")
-]
-
-# Root endpoint
-@app.get("/")
-async def root():
-    return {"message": "Hello from FastAPI backend!", "status": "running"}
-
-# Health check endpoint
-@app.get("/health")
-async def health_check():
-    return {"status": "healthy", "service": "orchids-challenge-api"}
-
-# Get all items
-@app.get("/items", response_model=List[Item])
-async def get_items():
-    return items_db
-
-# Get item by ID
-@app.get("/items/{item_id}", response_model=Item)
-async def get_item(item_id: int):
-    for item in items_db:
-        if item.id == item_id:
-            return item
-    return {"error": "Item not found"}
-
-# Create new item
-@app.post("/items", response_model=Item)
-async def create_item(item: ItemCreate):
-    new_id = max([item.id for item in items_db], default=0) + 1
-    new_item = Item(id=new_id, **item.dict())
-    items_db.append(new_item)
-    return new_item
-
-# Update item
-@app.put("/items/{item_id}", response_model=Item)
-async def update_item(item_id: int, item: ItemCreate):
-    for i, existing_item in enumerate(items_db):
-        if existing_item.id == item_id:
-            updated_item = Item(id=item_id, **item.dict())
-            items_db[i] = updated_item
-            return updated_item
-    return {"error": "Item not found"}
-
-# Delete item
-@app.delete("/items/{item_id}")
-async def delete_item(item_id: int):
-    for i, item in enumerate(items_db):
-        if item.id == item_id:
-            deleted_item = items_db.pop(i)
-            return {"message": f"Item {item_id} deleted successfully", "deleted_item": deleted_item}
-    return {"error": "Item not found"}
-
-#------------- Defaults -------------#
-
-
-class URLRequest(BaseModel):
+# Request schema
+class CloneRequest(BaseModel):
     url: str
 
-api_key = os.getenv("GEMINI_API_KEY")
-if not api_key:
-    raise RuntimeError("GEMINI_API_KEY not found in environment variables")
-
-# Correct way to configure the API key for google.generativeai
-genai.configure(api_key=api_key)
-
-@app.post("/scrape-and-analyze")
-# Endpoint to scrape a URL and return cleaned text content
-async def scrape_and_analyze(request: URLRequest):
-    url = request.url
-    print(f"Received URL to clone: {url}")
-
+@app.post("/api/clone")
+async def clone_website(req: CloneRequest):
     try:
-        async with httpx.AsyncClient() as http_client:
-            # Fetch the HTML content of the URL
-            response = await http_client.get(url, timeout=10)
-            response.raise_for_status() # Check if the request was successful by status code 400 or higher
-            if response.status_code != 200:
-                raise HTTPException(status_code=response.status_code, detail=f"Failed to fetch URL: {response.status_code}")
-            # Get the HTML content as text
-            html_content = response.text
-            print(f"Fetched HTML content from {url}")
+        html, inline_styles = await scrape_website(req.url)
+        html = html.decode("utf-8") if isinstance(html, (bytes, bytearray)) else str(html)
+        prompt = build_prompt(html, inline_styles)
+        cloned_html = await call_llm(prompt)
+        return {"cloned_html": cloned_html}
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to fetch URL: {str(e)}")
-            # Parse the HTML content using BeautifulSoup
-    soup = BeautifulSoup(html_content, 'lxml')
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
 
 
-    # Inline CSS styles are often used in web pages, so we should extract them
-    styles = ""
-    for link_tag in soup.find_all("link", rel="stylesheet"):
-        if isinstance(link_tag, Tag):
-            href = link_tag.get("href")
-            if href:
-                full_url = urljoin(url, str(href))
-                try:
-                    async with httpx.AsyncClient() as client:
-                        css_response = await client.get(full_url, timeout=5)
-                        css_response.raise_for_status()
-                        styles += f"\n/* From: {href} */\n" + css_response.text + "\n"
-                except:
-                    continue
-            link_tag.decompose()
-    
-    if styles:
-        style_tag = soup.new_tag("style")
-        style_tag.string = styles
-        if soup.head:
-            soup.head.append(style_tag)
+async def scrape_website(url: str):
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        page = await browser.new_page()
+        await page.goto(url, timeout=60000)
+        await page.wait_for_load_state("load")
 
-    for img in soup.find_all("img"):
-        if isinstance(img, Tag):
-            img["src"] = "https://via.placeholder.com/150"
-            img["alt"] = img.get("alt") or "placeholder image"
+        # Grab rendered HTML
+        html = await page.content()
+        soup = BeautifulSoup(html, "html.parser")
 
-    # Extract relevant information from the soup object
-    # Extract text content & tags
-    for tag in soup.find_all(['script', 'style', 'meta', 'noscript', 'header', 'footer', 'nav', 'form', 'iframe', 'aside', 'input', 'button', 'svg', 'link']):
-        tag.decompose()
+        # Extract inline <style> content
+        style_tags = soup.find_all("style")
+        inline_styles = "\n".join(tag.get_text() for tag in style_tags)
 
-    html_structure = soup.prettify()
-    print("Parsed HTML structure successfully.")
+        await browser.close()
+        return soup.prettify(), inline_styles
 
-    
-    # Send to Gemini
-    prompt = f"""
-You're an expert front-end engineer and web designer.
 
-Here is a raw HTML snapshot of a website, with some inline styles and a stylesheet included. 
-Your task is to **recreate** this site layout as accurately as possible in **a single self-contained HTML file**.
+def build_prompt(html: str, styles: str) -> str:
+    return f"""
+You are a frontend developer AI. Recreate a clean HTML clone of the following website.
 
-Use:
-- Inline `<style>` for all CSS
-- `<div>` and semantic tags for layout
-- `font-family`, `colors`, and `spacing` similar to original
-- Placeholder image: https://via.placeholder.com/300
-- Respect font sizes, layout flow, and header hierarchies
-- Recreate navigation, hero sections, buttons, etc. faithfully
+Use only inline CSS. Do not include external images or stylesheets. Use placeholder images and links where needed. Just return the HTML content, nothing else.
 
-### START OF HTML SNAPSHOT ###
-{html_structure}
-### END OF HTML SNAPSHOT ###
 
-Please return a complete HTML page starting with `<!DOCTYPE html>` and no explanation text.
+Here is the DOM:
+{html}
+
+Here is the CSS:
+{styles}
+
+Output a single standalone HTML page.
 """
 
-    try:
-        # Instantiate the model directly
-        model = genai.GenerativeModel(model_name="gemini-1.5-flash")
-        response = model.generate_content(prompt)
+def clean_llm_output(text: str) -> str:
+    # Remove anything before the actual HTML content
+    match = re.search(r"(<!(DOCTYPE html|doctype html)|<html)", text, re.IGNORECASE)
+    if match:
+        return text[match.start():].strip()
+    return text.strip()
 
-        # Safely access the summary text
-        if response.text:
-            html_output = response.text
-        else:
-            html_output = "<p>Could not generate HTML from LLM.</p>"
-            print("Warning: Empty LLM response.")
 
-        return {
-            "url": url,
-            "html": html_output
-        }
-    
-    except Exception as e:
-        print("LLM error:", e)
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"LLM error: {str(e)}")
-
-def main():
-    """Run the application"""
-    uvicorn.run(
-        "main:app",
-        host="127.0.0.1",
-        port=8000,
-        reload=True
+async def call_llm(prompt: str) -> str:
+    response = await openai.ChatCompletion.acreate(
+        model="gpt-4",  # Switch to "gpt-4" if you have access
+        messages=[
+            {"role": "system", "content": "You are a helpful assistant skilled at recreating websites."},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.3,
+        max_tokens=2000,
     )
 
+    raw_output = response["choices"][0]["message"]["content"]
 
-if __name__ == "__main__":
-    main()
+    match = re.search(r"```html\s*(.*?)\s*```", raw_output, re.DOTALL)
+    if match:
+        return match.group(1).strip()
+    
+    return clean_llm_output(raw_output)
