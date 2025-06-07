@@ -74,3 +74,6 @@ uvicorn main:app --reload
 3. Navigate to `http://localhost:3000` in your browser.  
 4. Enter a public website URL and click "Clone Website".  
 5. The cloned HTML page will render below.
+
+
+## ![Architecture Flowchart (Simple)](images/1748464302927.jpeg)  

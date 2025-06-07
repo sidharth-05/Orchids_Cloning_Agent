@@ -103,5 +103,4 @@ async def call_llm(prompt: str) -> str:
     match = re.search(r"```html\s*(.*?)\s*```", raw_output, re.DOTALL)
     if match:
         return match.group(1).strip()
-    
     return clean_llm_output(raw_output)
