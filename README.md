@@ -76,4 +76,4 @@ uvicorn main:app --reload
 5. The cloned HTML page will render below.
 
 
-## ![Architecture Flowchart (Simple)](images/1748464302927.jpeg)  
+## ![Architecture Flowchart (Simple)](images/178237812937.jpg)  
